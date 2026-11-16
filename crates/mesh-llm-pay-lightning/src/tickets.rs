@@ -8,10 +8,66 @@ impl Tickets {
     pub fn open(directory: &Path) -> Result<Self> {
         let db = Connection::open(directory.join("plugin-tickets.sqlite"))?;
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
-            CREATE TABLE IF NOT EXISTS tickets(id TEXT PRIMARY KEY, peer TEXT NOT NULL, model TEXT NOT NULL, ready INTEGER NOT NULL DEFAULT 0, exchange TEXT UNIQUE, admission TEXT);")?;
+            CREATE TABLE IF NOT EXISTS tickets(id TEXT PRIMARY KEY, peer TEXT NOT NULL, model TEXT NOT NULL, ready INTEGER NOT NULL DEFAULT 0, exchange TEXT UNIQUE, admission TEXT);
+            CREATE TABLE IF NOT EXISTS buyer_attempts (
+                id TEXT PRIMARY KEY,
+                peer TEXT NOT NULL,
+                exchange TEXT NOT NULL,
+                attempt TEXT NOT NULL,
+                verdict TEXT NOT NULL DEFAULT 'pending',
+                UNIQUE(exchange, peer, attempt)
+            );")?;
         // PaymentService abandons all admitted work at restart. Never revive its tickets.
         db.execute("DELETE FROM tickets WHERE exchange IS NULL", [])?;
         Ok(Self(Mutex::new(db)))
+    }
+
+    /// Bind the buyer's selected admission to the exact host audit attempt
+    /// before dispatch. An undispatched ticket has no final payment authority.
+    pub fn bind_buyer_attempt(
+        &self,
+        id: &str,
+        peer: &str,
+        exchange: &str,
+        attempt: &str,
+    ) -> Result<()> {
+        self.0.lock().unwrap().execute(
+            "INSERT INTO buyer_attempts(id, peer, exchange, attempt) VALUES (?1, ?2, ?3, ?4)",
+            params![id, peer, exchange, attempt],
+        )?;
+        Ok(())
+    }
+
+    /// A repeat terminal verdict cannot change the first decision.
+    pub fn resolve_buyer_audit(
+        &self,
+        exchange: &str,
+        peer: &str,
+        attempt: &str,
+        passed: bool,
+    ) -> Result<Option<String>> {
+        let verdict = if passed { "passed" } else { "withheld" };
+        Ok(self
+            .0
+            .lock()
+            .unwrap()
+            .query_row(
+                "UPDATE buyer_attempts SET verdict = ?4
+                 WHERE exchange = ?1 AND peer = ?2 AND attempt = ?3 AND verdict = 'pending'
+                 RETURNING id",
+                params![exchange, peer, attempt, verdict],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn buyer_final_allowed(&self, id: &str, peer: &str) -> Result<bool> {
+        Ok(self.0.lock().unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM buyer_attempts
+             WHERE id = ?1 AND peer = ?2 AND verdict = 'passed')",
+            params![id, peer],
+            |row| row.get(0),
+        )?)
     }
     pub fn insert(&self, id: &str, peer: &str, model: &str) -> Result<()> {
         self.0.lock().unwrap().execute(

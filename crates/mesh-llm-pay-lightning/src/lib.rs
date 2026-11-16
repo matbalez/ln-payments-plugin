@@ -101,9 +101,7 @@ pub struct Engine {
     ready_seen: std::sync::Mutex<BTreeSet<String>>,
     /// Sellers whose last deposit failed; the next selected request quotes again.
     requote: std::sync::Mutex<BTreeSet<String>>,
-    buyer_ready: std::sync::Mutex<BTreeSet<(String, String)>>,
-    /// The ready admission each `buyer_ready` entry stands for.
-    ready_ids: std::sync::Mutex<BTreeMap<(String, String), String>>,
+    buyer_ready: std::sync::Mutex<BTreeMap<(String, String), String>>,
     /// `payment.lifecycle.v1` publisher for the other plugins on this node.
     pub lifecycle: lifecycle::Lifecycle,
     changed: tokio::sync::Notify,
@@ -130,7 +128,6 @@ impl Engine {
             ready_seen: Default::default(),
             requote: Default::default(),
             buyer_ready: Default::default(),
-            ready_ids: Default::default(),
             lifecycle: Default::default(),
             changed: Default::default(),
             receipt_schedule: Default::default(),
@@ -297,6 +294,11 @@ impl Engine {
             .request_terms(&id)?
             .context("unknown buyer admission")?;
         ensure!(terms.peer == peer, "settlement from wrong seller");
+        // A settlement may arrive while inference or its audit is still in
+        // flight. A passed audit requests a fresh copy from the seller.
+        if !self.tickets.buyer_final_allowed(&id, peer)? {
+            return Ok(vec![]);
+        }
         let final_invoice = bill.invoice.clone();
         let settled = self
             .service
@@ -316,6 +318,38 @@ impl Engine {
         );
         self.service.finish_metered(&id).await?;
         Ok(vec![Message::Paid { id }])
+    }
+
+    /// Resolve an audited purchase from its local host lifecycle metadata.
+    /// Only the exact selected attempt can authorize its final invoice.
+    pub async fn buyer_terminal(&self, event: &Value) -> Result<Option<(String, Message)>> {
+        if event["phase"] != "exchange_finished"
+            || event["ingress_observation_point"] != "gateway_ingress"
+        {
+            return Ok(None);
+        }
+        let (Some(peer), Some(exchange), Some(attempt)) = (
+            event["target_peer_id"].as_str(),
+            event["exchange_id"].as_str(),
+            event["receipt_audit_attempt_id"].as_str(),
+        ) else {
+            return Ok(None);
+        };
+        let passed = event["receipt_audit"] == "passed"
+            && event["execution_outcome"] == "completed"
+            && matches!(event["status"].as_u64(), Some(200..=299));
+        let Some(id) = self
+            .tickets
+            .resolve_buyer_audit(exchange, peer, attempt, passed)?
+        else {
+            return Ok(None);
+        };
+        if passed {
+            return Ok(Some((peer.into(), Message::Recover { id })));
+        }
+        self.service.finish_metered(&id).await?;
+        self.lifecycle.abandoned(&id);
+        Ok(None)
     }
     /// Buyer side of a quoted admission: authorize against policy, pin the
     /// terms, pay any deposit, and tell the seller it is paid.
@@ -408,8 +442,7 @@ impl Engine {
         ensure!(terms.peer == peer, "ready from wrong seller");
         if self.ready_seen.lock().unwrap().insert(id.clone()) {
             let key = (peer.to_owned(), terms.model);
-            self.ready_ids.lock().unwrap().insert(key.clone(), id);
-            self.buyer_ready.lock().unwrap().insert(key);
+            self.buyer_ready.lock().unwrap().insert(key, id);
             self.changed.notify_waiters();
         }
         Ok(vec![])
@@ -480,7 +513,7 @@ impl Engine {
         let mut messages = Vec::new();
         // Observe uncertain payments before asking the authenticated seller for stored outcomes.
         for terms in self.service.reconcile_buyer().await?.approved {
-            if terms.peer == peer {
+            if terms.peer == peer && self.tickets.buyer_final_allowed(&terms.id, peer)? {
                 messages.push(Message::Recover { id: terms.id });
             }
         }
@@ -601,18 +634,26 @@ impl Engine {
         if self.buyer_enabled(peer).await {
             return None;
         }
-        let key = (peer.to_owned(), model.to_owned());
-        if self.buyer_ready.lock().unwrap().contains(&key) {
+        if self.has_ready_ticket(peer, model) {
             return Some(payment_required());
         }
         Some(OpenAiExchangeDecision::default())
     }
+
+    pub(crate) fn has_ready_ticket(&self, peer: &str, model: &str) -> bool {
+        self.buyer_ready
+            .lock()
+            .unwrap()
+            .contains_key(&(peer.to_owned(), model.to_owned()))
+    }
+
     /// Only an authenticated seller's Ready permits dispatch, never Hello timing.
     pub async fn buyer_wait(
         &self,
         peer: &str,
         model: &str,
-        exchange: Option<&str>,
+        exchange: &str,
+        audit_attempt: &str,
         deadline: std::time::Duration,
     ) -> Result<OpenAiExchangeDecision> {
         ensure!(self.buyer_enabled(peer).await, "seller not authorized");
@@ -622,18 +663,17 @@ impl Engine {
             let notified = self.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if self.buyer_ready.lock().unwrap().remove(&key) {
+            let ready = self.buyer_ready.lock().unwrap().remove(&key);
+            if let Some(id) = ready {
                 // The policy may have changed while this request waited for
                 // Ready: claim the ticket only if buying is still permitted.
                 if !self.buyer_enabled(peer).await {
-                    self.buyer_ready.lock().unwrap().insert(key);
+                    self.buyer_ready.lock().unwrap().entry(key).or_insert(id);
                     return Ok(payment_required());
                 }
-                if let (Some(id), Some(exchange)) =
-                    (self.ready_ids.lock().unwrap().remove(&key), exchange)
-                {
-                    self.lifecycle.payer_dispatched(&id, exchange);
-                }
+                self.tickets
+                    .bind_buyer_attempt(&id, peer, exchange, audit_attempt)?;
+                self.lifecycle.payer_dispatched(&id, exchange);
                 return Ok(OpenAiExchangeDecision::default());
             }
             if tokio::time::timeout_at(until, notified).await.is_err() {

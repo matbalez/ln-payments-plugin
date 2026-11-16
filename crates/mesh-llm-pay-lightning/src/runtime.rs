@@ -359,6 +359,9 @@ async fn run_with_setup(
                 if event["phase"] == "exchange_finished" {
                     tokio::spawn(async move {
                         let result: Result<()> = async {
+                            if let Some((peer, message)) = engine.buyer_terminal(&event).await? {
+                                send(&mut context, &peer, &message).await?;
+                            }
                             if let Some((peer, message)) = engine.terminal(&event).await? {
                                 send(&mut context, &peer, &message).await?;
                             }
@@ -376,10 +379,6 @@ async fn run_with_setup(
                 if event["phase"] == "backend_selected"
                     && let Some(peer) = event["target_peer_id"].as_str()
                 {
-                    let model = event["model"].as_str().unwrap_or_default();
-                    if let Some(decision) = engine.buyer_refusal(peer, model).await {
-                        return Ok(decision);
-                    }
                     let result = buyer_dispatch(&engine, peer, &event, &mut context).await;
                     return result.map_err(|error| {
                         mesh_llm_plugin::PluginError::internal(error.to_string())
@@ -413,6 +412,24 @@ async fn buyer_dispatch(
     context: &mut PluginContext<'_>,
 ) -> Result<mesh_llm_plugin::openai_exchange::OpenAiExchangeDecision> {
     let model = event["model"].as_str().context("selected model missing")?;
+    let paid_route = event["required_model_channels"].as_array().map_or_else(
+        || engine.has_ready_ticket(peer, model),
+        |channels| channels.iter().any(|channel| channel == CHANNEL),
+    );
+    if !paid_route {
+        return Ok(Default::default());
+    }
+    let (Some(exchange), Some(audit_attempt)) = (
+        event["exchange_id"].as_str().filter(|id| !id.is_empty()),
+        event["receipt_audit_attempt_id"]
+            .as_str()
+            .filter(|id| uuid::Uuid::parse_str(id).is_ok()),
+    ) else {
+        return Ok(crate::payment_required());
+    };
+    if event["receipt_audit"] != "pending" || engine.buyer_refusal(peer, model).await.is_some() {
+        return Ok(crate::payment_required());
+    }
     let deadline = std::time::Duration::from_secs(28);
     tokio::time::timeout(deadline, async {
         for message in engine.peer_up(peer).await? {
@@ -421,8 +438,9 @@ async fn buyer_dispatch(
                 return Err(error);
             }
         }
-        let exchange = event["exchange_id"].as_str();
-        engine.buyer_wait(peer, model, exchange, deadline).await
+        engine
+            .buyer_wait(peer, model, exchange, audit_attempt, deadline)
+            .await
     })
     .await
     .context("seller admission deadline exceeded")?

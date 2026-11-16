@@ -68,7 +68,22 @@ async fn distinct_wallet_children_settle_the_common_payment_protocol() {
         .unwrap()
         .remove(0);
     let paid = buyer.channel("seller", admission).await.unwrap().remove(0);
-    seller.channel("buyer", paid).await.unwrap();
+    let ready = seller.channel("buyer", paid).await.unwrap().remove(0);
+    buyer.channel("seller", ready).await.unwrap();
+    let buyer_decision = buyer
+        .buyer_wait(
+            "seller",
+            "model",
+            "buyer-exchange",
+            "cross-wallet-audit",
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        buyer_decision.decision,
+        mesh_llm_plugin::openai_exchange::OpenAiAdmissionDecision::Deny
+    );
     let decision = seller
         .gate(
             &json!({"phase":"request_received", "observation_point":"serving_host_ingress",
@@ -85,6 +100,20 @@ async fn distinct_wallet_children_settle_the_common_payment_protocol() {
         "exchange_id":"cross-wallet", "execution_outcome":"success", "status":200,
         "usage":{"prompt_tokens":2000,"completion_tokens":1000}}),
         )
+        .await
+        .unwrap()
+        .unwrap();
+    buyer
+        .buyer_terminal(&json!({
+            "phase":"exchange_finished",
+            "ingress_observation_point":"gateway_ingress",
+            "exchange_id":"buyer-exchange",
+            "target_peer_id":"seller",
+            "receipt_audit_attempt_id":"cross-wallet-audit",
+            "receipt_audit":"passed",
+            "execution_outcome":"completed",
+            "status":200
+        }))
         .await
         .unwrap()
         .unwrap();

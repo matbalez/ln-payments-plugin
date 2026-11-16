@@ -190,8 +190,34 @@ impl Fixture {
             .await
             .unwrap()
             .remove(0);
-        self.seller.channel("buyer", paid).await.unwrap();
+        let ready = self.seller.channel("buyer", paid).await.unwrap().remove(0);
+        self.buyer.channel("seller", ready).await.unwrap();
         id
+    }
+
+    async fn dispatch(&self, exchange: &str) {
+        let decision = self
+            .buyer
+            .buyer_wait(
+                "seller",
+                "model",
+                exchange,
+                exchange,
+                std::time::Duration::from_secs(1),
+            )
+            .await
+            .unwrap();
+        assert_ne!(decision.decision, Decision::Deny);
+    }
+
+    async fn audit_passed(&self, exchange: &str) {
+        assert!(
+            self.buyer
+                .buyer_terminal(&buyer_terminal(exchange, exchange, "seller", "passed"))
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }
 fn gate(exchange: &str, peer: &str) -> Value {
@@ -199,6 +225,156 @@ fn gate(exchange: &str, peer: &str) -> Value {
 }
 fn terminal(exchange: &str, usage: Value) -> Value {
     json!({"phase":"exchange_finished","ingress_observation_point":"serving_host_ingress","exchange_id":exchange,"execution_outcome":"success","status":200,"usage":usage})
+}
+
+fn buyer_terminal(exchange: &str, attempt: &str, peer: &str, verdict: &str) -> Value {
+    json!({
+        "phase": "exchange_finished",
+        "ingress_observation_point": "gateway_ingress",
+        "exchange_id": exchange,
+        "target_peer_id": peer,
+        "receipt_audit_attempt_id": attempt,
+        "receipt_audit": verdict,
+        "execution_outcome": "completed",
+        "status": 200,
+    })
+}
+
+async fn usage_settlement(f: &Fixture, exchange: &str) -> Message {
+    assert_eq!(
+        f.seller.gate(&gate(exchange, "buyer")).unwrap().decision,
+        Decision::Allow
+    );
+    f.seller
+        .terminal(&terminal(
+            exchange,
+            json!({"prompt_tokens":2000,"completion_tokens":1000}),
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .1
+}
+
+fn reopen_buyer(f: &Fixture) -> Engine {
+    let mut buyer = Engine::new(
+        f.buyer.service.clone(),
+        "706179",
+        100_000,
+        f._buyer_dir.path(),
+    )
+    .unwrap();
+    buyer.buy_peers.insert("seller".into());
+    buyer
+}
+
+#[tokio::test]
+async fn final_payment_waits_for_exact_attempt_pass_through_restart_and_recovery() {
+    let f = Fixture::new();
+    let id = f.prepare().await;
+    let exchange = "receipt-exchange";
+    f.dispatch(exchange).await;
+    let early_bill = usage_settlement(&f, exchange).await;
+    assert!(
+        f.buyer
+            .channel("seller", early_bill)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(f.network.sends.load(Ordering::SeqCst), 1, "deposit only");
+
+    let restarted = reopen_buyer(&f);
+    for result in [
+        buyer_terminal(exchange, "other-attempt", "seller", "passed"),
+        buyer_terminal(exchange, exchange, "other-seller", "passed"),
+    ] {
+        assert!(restarted.buyer_terminal(&result).await.unwrap().is_none());
+    }
+    assert!(
+        restarted
+            .peer_up("seller")
+            .await
+            .unwrap()
+            .iter()
+            .all(|message| !matches!(message, Message::Recover { .. }))
+    );
+    let exact = buyer_terminal(exchange, exchange, "seller", "passed");
+    let (peer, recover) = restarted.buyer_terminal(&exact).await.unwrap().unwrap();
+    assert_eq!(peer, "seller");
+    assert!(matches!(recover, Message::Recover { id: ref observed } if *observed == id));
+
+    // A restart after persisting the verdict can recover a lost settlement trigger.
+    let restarted = reopen_buyer(&f);
+    let recover = restarted
+        .peer_up("seller")
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|message| matches!(message, Message::Recover { .. }))
+        .unwrap();
+    let bill = f.seller.channel("buyer", recover).await.unwrap().remove(0);
+    let saved = serde_json::to_value(&bill).unwrap();
+    assert!(matches!(
+        &restarted.channel("seller", bill).await.unwrap()[..],
+        [Message::Paid { .. }]
+    ));
+    restarted
+        .channel("seller", serde_json::from_value(saved).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        f.network.sends.load(Ordering::SeqCst),
+        2,
+        "one deposit and one final"
+    );
+}
+
+#[tokio::test]
+async fn missing_failed_or_unverified_audit_keeps_final_wallet_send_disabled() {
+    for verdict in [
+        None,
+        Some("failed"),
+        Some("unverified"),
+        Some("interrupted"),
+    ] {
+        let f = Fixture::new();
+        let id = f.prepare().await;
+        let exchange = "receipt-exchange";
+        f.dispatch(exchange).await;
+        let bill = usage_settlement(&f, exchange).await;
+        if let Some(verdict) = verdict {
+            let mut terminal = buyer_terminal(exchange, exchange, "seller", verdict);
+            if verdict == "interrupted" {
+                terminal["receipt_audit"] = json!("passed");
+                terminal["execution_outcome"] = json!("cancelled");
+            }
+            assert!(f.buyer.buyer_terminal(&terminal).await.unwrap().is_none());
+            let duplicate = buyer_terminal(exchange, exchange, "seller", "passed");
+            assert!(f.buyer.buyer_terminal(&duplicate).await.unwrap().is_none());
+        }
+        assert!(
+            reopen_buyer(&f)
+                .channel("seller", bill)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            f.network.sends.load(Ordering::SeqCst),
+            1,
+            "deposit for {id} only"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_admission_without_a_bound_buyer_dispatch_cannot_pay_a_final() {
+    let f = Fixture::new();
+    f.prepare().await;
+    let bill = usage_settlement(&f, "no-buyer-dispatch").await;
+    assert!(f.buyer.channel("seller", bill).await.unwrap().is_empty());
+    assert_eq!(f.network.sends.load(Ordering::SeqCst), 1, "deposit only");
 }
 
 #[tokio::test]
@@ -209,6 +385,7 @@ async fn cold_deposit_gate_final_recovery_and_warm_admission() {
         Some(402)
     );
     let id = f.prepare().await;
+    f.dispatch("x").await;
     assert_eq!(f.network.sends.load(Ordering::SeqCst), 1);
     assert_eq!(
         f.seller.gate(&gate("x", "attacker")).unwrap().status,
@@ -244,6 +421,7 @@ async fn cold_deposit_gate_final_recovery_and_warm_admission() {
         serde_json::to_value(&settlement).unwrap(),
         serde_json::to_value(&recovered).unwrap()
     );
+    f.audit_passed("x").await;
     let paid = f
         .buyer
         .channel("seller", settlement)
@@ -315,6 +493,8 @@ async fn unsolicited_seller_or_excess_rates_never_pay() {
 async fn forged_final_bill_and_wrong_sender_are_rejected() {
     let f = Fixture::new();
     let id = f.prepare().await;
+    f.dispatch("x").await;
+    f.audit_passed("x").await;
     f.seller.gate(&gate("x", "buyer")).unwrap();
     let (_, message) = f
         .seller
@@ -493,6 +673,8 @@ async fn repeated_quote_returns_same_unconsumed_invoice() {
 async fn peer_reconnect_recovers_debt_before_new_quote() {
     let f = Fixture::new();
     let id = f.prepare().await;
+    f.dispatch("x").await;
+    f.audit_passed("x").await;
     let messages = f.buyer.peer_up("seller").await.unwrap();
     assert!(matches!(&messages[1],Message::Recover{id:recovered} if recovered==&id));
     assert!(matches!(messages.last().unwrap(), Message::Quote));
@@ -553,9 +735,13 @@ async fn buyer_vouches_only_once_for_ready_ticket() {
 #[tokio::test]
 async fn selected_buyer_waits_for_authenticated_ready_and_consumes_it_once() {
     let f = Fixture::new();
-    let wait = f
-        .buyer
-        .buyer_wait("seller", "model", None, std::time::Duration::from_secs(2));
+    let wait = f.buyer.buyer_wait(
+        "seller",
+        "model",
+        "first",
+        "first",
+        std::time::Duration::from_secs(2),
+    );
     let deliver = async {
         tokio::task::yield_now().await;
         let admission = f
@@ -595,7 +781,8 @@ async fn selected_buyer_waits_for_authenticated_ready_and_consumes_it_once() {
         .buyer_wait(
             "seller",
             "model",
-            None,
+            "second",
+            "second",
             std::time::Duration::from_millis(10),
         )
         .await
@@ -725,6 +912,7 @@ async fn warm_strike_recovery(withhold_paid: bool) {
 
 async fn seed_warm_standing(f: &Fixture) {
     f.prepare().await;
+    f.dispatch("seed").await;
     let cold = gate("seed", "buyer");
     assert_eq!(f.seller.gate(&cold).unwrap().decision, Decision::Allow);
     assert!(f.seller.replenish(&cold).await.unwrap().is_some());
@@ -737,6 +925,7 @@ async fn seed_warm_standing(f: &Fixture) {
         .await
         .unwrap()
         .unwrap();
+    f.audit_passed("seed").await;
     let paid = f.buyer.channel("seller", bill).await.unwrap().remove(0);
     let warm = f
         .seller
@@ -756,15 +945,10 @@ async fn issue_unpaid_finals(f: &Fixture) -> Vec<Message> {
     // settlement completes, but the existing three-unpaid-final bound still wins.
     let mut withheld = Vec::new();
     for index in 0..mesh_llm_payments::ledger::metered::STRIKE_LIMIT {
-        let event = gate(&format!("warm-{index}"), "buyer");
-        assert_eq!(
-            f.buyer
-                .buyer_wait("seller", "model", None, std::time::Duration::from_secs(1))
-                .await
-                .unwrap()
-                .decision,
-            Decision::Abstain
-        );
+        let exchange = format!("warm-{index}");
+        f.dispatch(&exchange).await;
+        f.audit_passed(&exchange).await;
+        let event = gate(&exchange, "buyer");
         assert_eq!(f.seller.gate(&event).unwrap().decision, Decision::Allow);
         let (_, mut replies) = tokio::time::timeout(
             std::time::Duration::from_secs(1),
@@ -1063,7 +1247,8 @@ async fn both_sides_publish_lifecycle_events_joined_on_their_exchange() {
         .buyer_wait(
             "seller",
             "model",
-            Some("buyer-exchange"),
+            "buyer-exchange",
+            "buyer-attempt",
             std::time::Duration::from_secs(1),
         )
         .await
@@ -1085,6 +1270,8 @@ async fn both_sides_publish_lifecycle_events_joined_on_their_exchange() {
         .await
         .unwrap()
         .unwrap();
+    let trusted = buyer_terminal("buyer-exchange", "buyer-attempt", "seller", "passed");
+    f.buyer.buyer_terminal(&trusted).await.unwrap().unwrap();
     let paid = f
         .buyer
         .channel("seller", settlement)
@@ -1210,7 +1397,8 @@ async fn ready_ticket_is_not_claimed_once_policy_stops_buying() {
             .buyer_wait(
                 "seller",
                 "model",
-                None,
+                "x",
+                "x",
                 std::time::Duration::from_millis(10)
             )
             .await
@@ -1262,6 +1450,7 @@ async fn reconnect_is_not_held_by_a_wedged_seller_receipt_lookup() {
 async fn abandonment_cannot_replace_an_accepted_bill() {
     let f = Fixture::new();
     let id = f.prepare().await;
+    f.dispatch("x").await;
     f.seller.gate(&gate("x", "buyer")).unwrap();
     let (_, settlement) = f
         .seller
@@ -1272,6 +1461,7 @@ async fn abandonment_cannot_replace_an_accepted_bill() {
         .await
         .unwrap()
         .unwrap();
+    f.audit_passed("x").await;
     f.buyer.channel("seller", settlement).await.unwrap();
     assert!(
         f.buyer

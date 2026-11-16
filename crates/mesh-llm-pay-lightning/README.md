@@ -123,6 +123,15 @@ after the host's binding deadline; that does not retry a payment. One outstandin
 ticket per buyer/model is supported; restart abandons interrupted work and drops
 unconsumed tickets rather than replaying inference.
 
+Paid buying requires a Mesh build with receipt audit lifecycle metadata. On the
+buyer, set `require = true` under `[receipts]`, or set `audit = true` and send
+`x-mesh-trust: receipts` on each paid request. The buyer only submits a final
+usage payment after its own host reports a passed audit for the selected
+attempt. If a final invoice arrives first, the buyer retrieves it after the
+audit passes. A failed, unavailable, or interrupted audit leaves the final
+unpaid. The admission deposit stays paid. Previously submitted Lightning
+payments can still be reconciled by hash after an upgrade.
+
 ## Offline development and evidence boundaries
 
 Run `just check`, `just test`, `just build`, `just package` from the repository
